@@ -3,6 +3,7 @@ import logging
 import asyncio
 import qrcode
 from io import BytesIO
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, 
@@ -37,61 +38,110 @@ class SessionManager:
     def __init__(self):
         self.active_sessions = {}
         self.qr_sessions = {}
+        self.session_timeouts = {}
+    
+    async def cleanup_old_sessions(self):
+        """Очистка устаревших сессий"""
+        now = datetime.now()
+        expired_sessions = []
+        
+        for user_id, timeout in self.session_timeouts.items():
+            if now > timeout:
+                expired_sessions.append(user_id)
+        
+        for user_id in expired_sessions:
+            if user_id in self.active_sessions:
+                try:
+                    await self.active_sessions[user_id]['client'].disconnect()
+                    del self.active_sessions[user_id]
+                except:
+                    pass
+            if user_id in self.qr_sessions:
+                try:
+                    await self.qr_sessions[user_id]['client'].disconnect()
+                    del self.qr_sessions[user_id]
+                except:
+                    pass
+            del self.session_timeouts[user_id]
+            logger.info(f"🧹 Очищена устаревшая сессия для {user_id}")
+    
+    async def create_fresh_session(self, phone: str, user_id: int, method: str):
+        """Создание новой свежей сессии"""
+        try:
+            # Очищаем старую сессию если есть
+            if user_id in self.active_sessions:
+                try:
+                    await self.active_sessions[user_id]['client'].disconnect()
+                except:
+                    pass
+                del self.active_sessions[user_id]
+            
+            # Создаем нового клиента
+            client = TelegramClient(
+                StringSession(), 
+                API_ID, 
+                API_HASH,
+                device_model="iPhone",
+                system_version="iOS 15.0",
+                app_version="8.0"
+            )
+            
+            await client.connect()
+            logger.info(f"🔗 Новый клиент создан для {phone}")
+            
+            # Отправляем запрос кода
+            sent_code = await client.send_code_request(phone)
+            logger.info(f"📨 Код отправлен для {phone}")
+            
+            # Сохраняем сессию с временной меткой
+            self.active_sessions[user_id] = {
+                'client': client,
+                'phone': phone,
+                'phone_code_hash': sent_code.phone_code_hash,
+                'method': method,
+                'created_at': datetime.now()
+            }
+            
+            # Устанавливаем таймаут 10 минут
+            self.session_timeouts[user_id] = datetime.now() + timedelta(minutes=10)
+            
+            return True, "✅ Код отправлен! У вас есть 10 минут чтобы ввести код."
+            
+        except FloodWaitError as e:
+            wait_time = e.seconds
+            return False, f"❌ Слишком много запросов. Подождите {wait_time} секунд"
+        except PhoneNumberInvalidError:
+            return False, "❌ Неверный номер телефона"
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания сессии: {e}")
+            return False, f"❌ Ошибка: {str(e)}"
     
     # 🔥 МЕТОД 1: Автоматическая отправка кода
     async def auto_method(self, phone: str, user_id: int):
         """Автоматическая отправка кода"""
-        try:
-            client = TelegramClient(StringSession(), API_ID, API_HASH)
-            await client.connect()
-            
-            sent_code = await client.send_code_request(phone)
-            
-            self.active_sessions[user_id] = {
-                'client': client,
-                'phone': phone,
-                'phone_code_hash': sent_code.phone_code_hash,
-                'method': 'auto'
-            }
-            
-            return True, "✅ Запрос кода отправлен! Проверьте Telegram."
-            
-        except FloodWaitError as e:
-            return False, f"❌ Слишком много запросов. Подождите {e.seconds} секунд"
-        except PhoneNumberInvalidError:
-            return False, "❌ Неверный номер телефона"
-        except Exception as e:
-            logger.error(f"Auto method error: {e}")
-            return False, f"❌ Ошибка: {str(e)}"
+        await self.cleanup_old_sessions()
+        return await self.create_fresh_session(phone, user_id, 'auto')
     
     # 🔥 МЕТОД 2: Ручной ввод кода
     async def manual_method(self, phone: str, user_id: int):
         """Ручной метод"""
-        try:
-            client = TelegramClient(StringSession(), API_ID, API_HASH)
-            await client.connect()
-            
-            sent_code = await client.send_code_request(phone)
-            
-            self.active_sessions[user_id] = {
-                'client': client,
-                'phone': phone,
-                'phone_code_hash': sent_code.phone_code_hash,
-                'method': 'manual'
-            }
-            
-            return True, (
-                "📱 **Ручной метод:**\n\n"
-                "Код отправлен в Telegram. Введите код:\n\n"
-                "🔢 **Форматы:** 12345 или 12-345"
-            )
-        except Exception as e:
-            return False, f"❌ Ошибка: {str(e)}"
+        await self.cleanup_old_sessions()
+        return await self.create_fresh_session(phone, user_id, 'manual')
     
     # 🔥 МЕТОД 3: QR-код
     async def qr_method(self, user_id: int):
         """Метод с QR-кодом"""
         try:
+            await self.cleanup_old_sessions()
+            
+            # Очищаем старую QR сессию
+            if user_id in self.qr_sessions:
+                try:
+                    await self.qr_sessions[user_id]['client'].disconnect()
+                except:
+                    pass
+                del self.qr_sessions[user_id]
+            
             client = TelegramClient(StringSession(), API_ID, API_HASH)
             await client.connect()
             
@@ -99,8 +149,12 @@ class SessionManager:
             
             self.qr_sessions[user_id] = {
                 'client': client,
-                'qr_login': qr_login
+                'qr_login': qr_login,
+                'created_at': datetime.now()
             }
+            
+            # Таймаут 5 минут для QR
+            self.session_timeouts[user_id] = datetime.now() + timedelta(minutes=5)
             
             # Создаем QR-код
             qr = qrcode.QRCode(version=1, box_size=10, border=5)
@@ -117,19 +171,25 @@ class SessionManager:
         except Exception as e:
             return False, f"❌ Ошибка QR-метода: {str(e)}", None
     
-    # 🔥 ИСПРАВЛЕННАЯ ПРОВЕРКА КОДА
+    # 🔥 УЛУЧШЕННАЯ ПРОВЕРКА КОДА
     async def verify_code(self, user_id: int, code: str):
-        """Проверка кода с улучшенной обработкой"""
+        """Проверка кода с обновлением сессии при устаревании"""
+        await self.cleanup_old_sessions()
+        
         if user_id not in self.active_sessions:
-            return False, "❌ Сессия не найдена. Начните с /start"
+            return False, "❌ Сессия не найдена или устарела. Начните с /start"
         
         data = self.active_sessions[user_id]
         
+        # Проверяем не устарела ли сессия
+        if datetime.now() > self.session_timeouts[user_id]:
+            return False, "❌ Время сессии истекло. Начните с /start"
+        
         try:
-            # Очищаем код от лишних символов
+            # Очищаем код
             clean_code = code.replace(' ', '').replace('-', '').strip()
             
-            logger.info(f"🔄 Проверка кода: {clean_code} для {data['phone']}")
+            logger.info(f"🔄 Проверка кода для {data['phone']}")
             
             # Пытаемся войти
             await data['client'].sign_in(
@@ -138,56 +198,42 @@ class SessionManager:
                 phone_code_hash=data['phone_code_hash']
             )
             
-            # Успешная авторизация
+            # Успех!
             session_string = data['client'].session.save()
             await data['client'].disconnect()
-            del self.active_sessions[user_id]
             
-            logger.info("✅ Код верный, сессия создана")
+            # Очищаем сессии
+            del self.active_sessions[user_id]
+            if user_id in self.session_timeouts:
+                del self.session_timeouts[user_id]
+            
+            logger.info("✅ Сессия успешно создана!")
             return True, session_string
             
+        except PhoneCodeExpiredError:
+            logger.warning("🕐 Код устарел, пробуем обновить...")
+            # Пробуем запросить новый код
+            try:
+                # Создаем новую сессию с тем же номером
+                success, message = await self.create_fresh_session(
+                    data['phone'], user_id, data['method']
+                )
+                if success:
+                    return False, "🔄 Код устарел. Новый код отправлен! Введите новый код:"
+                else:
+                    return False, "❌ Код устарел. Не удалось отправить новый код. Попробуйте /start"
+            except Exception as e:
+                return False, f"❌ Код устарел. Ошибка обновления: {str(e)}"
+                
         except SessionPasswordNeededError:
-            logger.info("🔐 Требуется 2FA пароль")
             return False, "2FA_NEEDED"
         except PhoneCodeInvalidError:
-            logger.warning("❌ Неверный код")
             return False, "❌ Неверный код подтверждения"
-        except PhoneCodeExpiredError:
-            logger.warning("❌ Код устарел")
-            return False, "❌ Код устарел. Запросите новый код с /start"
         except FloodWaitError as e:
-            logger.warning(f"⏳ Flood wait: {e.seconds} сек")
             return False, f"❌ Слишком много попыток. Подождите {e.seconds} секунд"
         except Exception as e:
-            logger.error(f"❌ Ошибка проверки кода: {e}")
-            # Пробуем альтернативный метод
-            return await self.try_alternative_login(user_id, clean_code)
-    
-    # 🔥 АЛЬТЕРНАТИВНЫЙ МЕТОД ВХОДА
-    async def try_alternative_login(self, user_id: int, code: str):
-        """Альтернативный метод входа"""
-        if user_id not in self.active_sessions:
-            return False, "❌ Сессия не найдена"
-        
-        data = self.active_sessions[user_id]
-        
-        try:
-            # Пробуем метод start вместо sign_in
-            await data['client'].start(
-                phone=lambda: data['phone'],
-                code=lambda: code,
-                password=None
-            )
-            
-            session_string = data['client'].session.save()
-            await data['client'].disconnect()
-            del self.active_sessions[user_id]
-            
-            return True, session_string
-        except Exception as e:
-            await data['client'].disconnect()
-            del self.active_sessions[user_id]
-            return False, f"❌ Ошибка входа: {str(e)}"
+            logger.error(f"❌ Ошибка входа: {e}")
+            return False, f"❌ Ошибка: {str(e)}"
     
     # 🔥 ПРОВЕРКА ПАРОЛЯ 2FA
     async def verify_password(self, user_id: int, password: str):
@@ -201,12 +247,18 @@ class SessionManager:
             await data['client'].sign_in(password=password)
             session_string = data['client'].session.save()
             await data['client'].disconnect()
+            
+            # Очищаем
             del self.active_sessions[user_id]
+            if user_id in self.session_timeouts:
+                del self.session_timeouts[user_id]
             
             return True, session_string
         except Exception as e:
             await data['client'].disconnect()
             del self.active_sessions[user_id]
+            if user_id in self.session_timeouts:
+                del self.session_timeouts[user_id]
             return False, f"❌ Неверный пароль 2FA"
     
     # 🔥 ОЖИДАНИЕ QR-АВТОРИЗАЦИИ
@@ -218,37 +270,52 @@ class SessionManager:
         data = self.qr_sessions[user_id]
         
         try:
+            # Ждем с таймаутом 2 минуты
             await asyncio.wait_for(data['qr_login'].wait(), timeout=120)
+            
             session_string = data['client'].session.save()
             await data['client'].disconnect()
+            
+            # Очищаем
             del self.qr_sessions[user_id]
+            if user_id in self.session_timeouts:
+                del self.session_timeouts[user_id]
             
             return True, session_string
             
         except asyncio.TimeoutError:
             await data['client'].disconnect()
-            del self.qr_sessions[user_id]
-            return False, "❌ Время ожидания истекло"
+            if user_id in self.qr_sessions:
+                del self.qr_sessions[user_id]
+            if user_id in self.session_timeouts:
+                del self.session_timeouts[user_id]
+            return False, "❌ Время ожидания истекло. QR-код не был отсканирован."
         except Exception as e:
             await data['client'].disconnect()
-            del self.qr_sessions[user_id]
-            return False, f"❌ Ошибка QR-авторизации: {str(e)}"
+            if user_id in self.qr_sessions:
+                del self.qr_sessions[user_id]
+            if user_id in self.session_timeouts:
+                del self.session_timeouts[user_id]
+            return False, f"❌ Ошибка: {str(e)}"
 
 manager = SessionManager()
 
 # 🔥 ГЛАВНОЕ МЕНЮ
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Начало - выбор метода"""
+    # Очищаем старые сессии при старте
+    await manager.cleanup_old_sessions()
+    
     keyboard = [
         [InlineKeyboardButton("🔐 Автоматическая отправка", callback_data="auto")],
         [InlineKeyboardButton("📱 Ручной ввод кода", callback_data="manual")],
-        [InlineKeyboardButton("📷 QR-код (рекомендуется)", callback_data="qr")]
+        [InlineKeyboardButton("📷 QR-код (надежно)", callback_data="qr")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
         "🔐 **Генератор сессий Telegram**\n\n"
-        "💡 **Если код не приходит или не работает - используйте QR-код!**\n\n"
+        "💡 **Рекомендация:** Используйте QR-код - он не устаревает!\n\n"
         "Выберите способ:",
         reply_markup=reply_markup
     )
@@ -276,8 +343,8 @@ async def handle_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                        "1. Откройте Telegram → Настройки\n"
                        "2. Устройства → Подключить устройство\n" 
                        "3. Отсканируйте QR-код\n"
-                       "4. Подождите...\n\n"
-                       "⏳ Ожидаем ~2 минуты"
+                       "4. Подождите подтверждения...\n\n"
+                       "⏳ Действует 5 минут"
             )
             
             # Фоновая обработка QR
@@ -292,16 +359,15 @@ async def handle_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await query.edit_message_text(
             f"📱 **Метод {method_name}**\n\n"
             f"Отправьте номер телефона:\n"
-            f"Формат: +79123456789"
+            f"Формат: +79123456789\n\n"
+            f"⏰ Код действителен 10 минут"
         )
         return PHONE
 
 async def process_qr_login(user_id: int, message):
     """Фоновая обработка QR-логина"""
     try:
-        # Даем время на сканирование
-        await asyncio.sleep(5)
-        
+        # Ждем авторизацию
         success, result = await manager.wait_qr_login(user_id)
         
         if success:
@@ -312,7 +378,7 @@ async def process_qr_login(user_id: int, message):
             )
             await message.reply_text(f"`{result}`", parse_mode='Markdown')
         else:
-            await message.reply_text(f"❌ {result}\n\nПопробуйте /start")
+            await message.reply_text(f"{result}\n\nПопробуйте снова: /start")
     except Exception as e:
         await message.reply_text(f"❌ Ошибка: {str(e)}")
 
@@ -326,7 +392,7 @@ async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await update.message.reply_text("❌ Используйте формат +79123456789")
         return PHONE
     
-    await update.message.reply_text("🔄 Отправляем запрос...")
+    await update.message.reply_text("🔄 Создаем свежую сессию...")
     
     if method == 'auto':
         success, message = await manager.auto_method(phone, user_id)
@@ -337,13 +403,16 @@ async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await update.message.reply_text(
             f"✅ {message}\n\n"
             f"🔢 **Введите код:**\n"
-            f"• Только цифры\n" 
-            f"• Без пробелов\n"
+            f"• Только цифры (5 цифр)\n" 
+            f"• Без пробелов и дефисов\n"
             f"• Пример: 12345"
         )
         return CODE
     else:
-        await update.message.reply_text(f"{message}\n\nПопробуйте QR-код: /start")
+        await update.message.reply_text(
+            f"{message}\n\n"
+            f"💡 Попробуйте QR-код - он надежнее: /start"
+        )
         return ConversationHandler.END
 
 async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -351,11 +420,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     code = update.message.text
     user_id = update.effective_user.id
     
-    logger.info(f"📨 Получен код: {code} от пользователя {user_id}")
-    
-    if not any(char.isdigit() for char in code):
-        await update.message.reply_text("❌ Код должен содержать цифры")
-        return CODE
+    logger.info(f"📨 Получен код от пользователя {user_id}")
     
     await update.message.reply_text("🔄 Проверяем код...")
     
@@ -372,12 +437,16 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await update.message.reply_text(f"`{result}`", parse_mode='Markdown')
         
     elif result == "2FA_NEEDED":
-        await update.message.reply_text("🔐 Введите пароль 2FA:")
+        await update.message.reply_text("🔐 Введите пароль двухфакторной аутентификации:")
         return PASSWORD
     else:
-        # Подробная информация об ошибке
-        error_msg = result + "\n\n💡 **Попробуйте:**\n• Проверить код\n• Использовать QR-код\n• Подождать 2 минуты"
-        await update.message.reply_text(error_msg)
+        await update.message.reply_text(
+            f"{result}\n\n"
+            f"💡 **Советы:**\n"
+            f"• Используйте QR-код (/start)\n"
+            f"• Вводите код быстро\n"
+            f"• Проверьте правильность номера"
+        )
     
     return ConversationHandler.END
 
@@ -420,8 +489,17 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             del manager.qr_sessions[user_id]
         except: pass
     
-    await update.message.reply_text("❌ Отменено")
+    if user_id in manager.session_timeouts:
+        del manager.session_timeouts[user_id]
+    
+    await update.message.reply_text("❌ Операция отменена")
     return ConversationHandler.END
+
+# Периодическая очистка старых сессий
+async def cleanup_task():
+    while True:
+        await asyncio.sleep(60)  # Каждую минуту
+        await manager.cleanup_old_sessions()
 
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
@@ -440,7 +518,10 @@ def main():
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("start", start))
     
-    logger.info("🤖 Бот запущен с улучшенной проверкой кодов!")
+    # Запускаем фоновую очистку
+    asyncio.create_task(cleanup_task())
+    
+    logger.info("🤖 Бот запущен с системой очистки устаревших сессий!")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
