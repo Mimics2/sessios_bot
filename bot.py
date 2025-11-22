@@ -3,10 +3,14 @@ import logging
 import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-from telegram.error import Conflict
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+from telethon.errors import (
+    SessionPasswordNeededError, 
+    PhoneCodeInvalidError,
+    PhoneNumberInvalidError,
+    FloodWaitError
+)
 
 # Настройка логирования
 logging.basicConfig(
@@ -15,10 +19,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Конфиг
+# Конфиг - ИСПОЛЬЗУЙ СВОИ API КЛЮЧИ!
 BOT_TOKEN = os.environ['BOT_TOKEN']
-API_ID = int(os.environ.get('API_ID', '2040'))
-API_HASH = os.environ.get('API_HASH', 'b18441a1ff607e10a989891a5462e627')
+API_ID = int(os.environ.get('API_ID', 'YOUR_API_ID'))  # ЗАМЕНИ!
+API_HASH = os.environ.get('API_HASH', 'YOUR_API_HASH')  # ЗАМЕНИ!
 
 PHONE, CODE, PASSWORD = range(3)
 
@@ -31,21 +35,26 @@ class SessionManager:
         try:
             logger.info(f"🔄 Starting session for {phone}")
             
-            # Создаем клиента
+            # Создаем клиента с правильными параметрами
             client = TelegramClient(
                 StringSession(), 
                 API_ID, 
                 API_HASH,
-                device_model="Session Bot",
-                system_version="1.0",
-                app_version="1.0"
+                device_model="iPhone",
+                system_version="iOS 15.0",
+                app_version="8.0",
+                lang_code="en",
+                system_lang_code="en"
             )
             
             await client.connect()
             logger.info("✅ Client connected")
             
-            # Отправляем запрос на код
-            sent_code = await client.send_code_request(phone)
+            # Отправляем запрос на код с правильными параметрами
+            sent_code = await client.send_code_request(
+                phone,
+                force_sms=False  # Пытаемся отправить как код в приложение
+            )
             logger.info(f"📲 Code request sent for {phone}")
             
             # Сохраняем данные сессии
@@ -55,11 +64,15 @@ class SessionManager:
                 'phone_code_hash': sent_code.phone_code_hash
             }
             
-            return True, "✅ Код отправлен! Проверьте Telegram на вашем устройстве."
+            return True, "✅ Запрос кода отправлен! Проверьте:\n• Официальное приложение Telegram\n• СМС сообщения\n• Если код не пришел, попробуйте через 2-3 минуты"
             
+        except PhoneNumberInvalidError:
+            return False, "❌ Неверный номер телефона"
+        except FloodWaitError as e:
+            return False, f"❌ Слишком много запросов. Подождите {e.seconds} секунд"
         except Exception as e:
             logger.error(f"❌ Error sending code: {e}")
-            return False, f"❌ Ошибка при отправке кода: {str(e)}"
+            return False, f"❌ Ошибка: {str(e)}"
     
     async def verify_code(self, user_id: int, code: str):
         """Проверяем код подтверждения"""
@@ -121,7 +134,7 @@ class SessionManager:
             logger.error(f"❌ 2FA error: {e}")
             await data['client'].disconnect()
             del self.active_sessions[user_id]
-            return False, f"❌ Неверный пароль 2FA: {str(e)}"
+            return False, f"❌ Неверный пароль 2FA"
 
 manager = SessionManager()
 
@@ -141,7 +154,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "🔐 **Telegram Session Generator**\n\n"
         "📱 Отправьте номер телефона в международном формате:\n"
         "**Пример:** +79123456789\n\n"
-        "⚠️ Убедитесь, что можете получить код в Telegram!"
+        "⚠️ **ВАЖНО:** Убедитесь, что номер активен в Telegram!"
     )
     return PHONE
 
@@ -155,12 +168,8 @@ async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await update.message.reply_text("❌ Используйте международный формат, начиная с +")
         return PHONE
     
-    if len(phone) < 10:
-        await update.message.reply_text("❌ Номер слишком короткий")
-        return PHONE
-    
     # Показываем что бот работает
-    processing_msg = await update.message.reply_text("🔄 Отправляем код...")
+    processing_msg = await update.message.reply_text("🔄 Отправляем запрос кода...")
     
     # Отправляем код
     success, message = await manager.start_session(phone, user_id)
@@ -169,7 +178,7 @@ async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await processing_msg.edit_text(
             f"✅ {message}\n\n"
             f"📨 **Введите код подтверждения:**\n"
-            f"(5 цифр, например: 12345)"
+            f"(5 цифр)"
         )
         return CODE
     else:
@@ -185,8 +194,8 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     user_id = update.effective_user.id
     
     # Валидация кода
-    if not code.isdigit() or len(code) != 5:
-        await update.message.reply_text("❌ Код должен содержать 5 цифр")
+    if not code.isdigit() or len(code) < 4:
+        await update.message.reply_text("❌ Код должен содержать только цифры (4-5 цифр)")
         return CODE
     
     processing_msg = await update.message.reply_text("🔄 Проверяем код...")
@@ -199,22 +208,17 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         
         # Отправляем файл с сессией
         phone = manager.active_sessions.get(user_id, {}).get('phone', 'unknown')
-        filename = f"session_{phone.replace('+', '')}.txt"
         
         await update.message.reply_document(
             document=result.encode('utf-8'),
-            filename=filename,
-            caption=f"✅ **Сессия создана!**\n\n"
-                   f"📱 Номер: `{phone}`\n"
-                   f"💾 Файл: `{filename}`\n\n"
-                   f"⚠️ **Сохраните этот файл в безопасном месте!**",
+            filename=f"session_{phone.replace('+', '')}.txt",
+            caption=f"✅ **Сессия создана!**\n\n📱 Номер: `{phone}`",
             parse_mode='Markdown'
         )
         
         # Дублируем строку сессии
         await update.message.reply_text(
-            f"📋 **Session String:**\n"
-            f"```\n{result}\n```",
+            f"📋 **Session String:**\n```\n{result}\n```",
             parse_mode='Markdown'
         )
         
@@ -245,11 +249,10 @@ async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await processing_msg.edit_text("✅ Пароль верный! Создаем сессию...")
         
         phone = manager.active_sessions.get(user_id, {}).get('phone', 'unknown')
-        filename = f"session_{phone.replace('+', '')}.txt"
         
         await update.message.reply_document(
             document=session_string.encode('utf-8'),
-            filename=filename,
+            filename=f"session_{phone.replace('+', '')}.txt",
             caption=f"✅ **Сессия создана!**\n\n📱 Номер: `{phone}`",
             parse_mode='Markdown'
         )
@@ -281,10 +284,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ Операция отменена")
     return ConversationHandler.END
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик ошибок"""
-    logger.error(f"Error: {context.error}")
-
 def main():
     # Проверяем токен
     if not BOT_TOKEN:
@@ -293,9 +292,6 @@ def main():
     
     # Создаем приложение
     application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Добавляем обработчик ошибок
-    application.add_error_handler(error_handler)
     
     # Conversation handler
     conv_handler = ConversationHandler(
@@ -309,17 +305,11 @@ def main():
     )
     
     application.add_handler(conv_handler)
-    application.add_handler(CommandHandler("help", lambda u, c: u.message.reply_text("Используйте /start")))
     
     # Запускаем бота
     try:
         logger.info("🤖 Starting bot...")
-        application.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
-        )
-    except Conflict:
-        logger.error("❌ Bot already running!")
+        application.run_polling(drop_pending_updates=True)
     except Exception as e:
         logger.error(f"❌ Critical error: {e}")
 
