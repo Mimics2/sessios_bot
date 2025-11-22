@@ -1,4 +1,5 @@
-python-telegram-bot==20.7
+aiogram==3.10.0
 telethon==1.28.5
 qrcode[pil]==7.4.2
 Pillow==10.0.1
+aiofiles==23.2.1
