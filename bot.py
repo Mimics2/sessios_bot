@@ -63,16 +63,20 @@ class SessionManager:
             logger.error(f"Auto method error: {e}")
             return False, f"❌ Ошибка: {str(e)}"
     
-    # 🔥 МЕТОД 2: Ручной ввод кода
+    # 🔥 МЕТОД 2: Ручной ввод кода (ИСПРАВЛЕННЫЙ)
     async def manual_method(self, phone: str, user_id: int):
         """Ручной метод - пользователь сам получает код"""
         try:
             client = TelegramClient(StringSession(), API_ID, API_HASH)
             await client.connect()
             
+            # Для ручного метода тоже отправляем код, но пользователь получает его сам
+            sent_code = await client.send_code_request(phone)
+            
             self.active_sessions[user_id] = {
                 'client': client,
                 'phone': phone,
+                'phone_code_hash': sent_code.phone_code_hash,
                 'method': 'manual'
             }
             
@@ -118,7 +122,7 @@ class SessionManager:
         except Exception as e:
             return False, f"❌ Ошибка QR-метода: {str(e)}", None
     
-    # 🔥 ОБРАБОТКА КОДА ДЛЯ АВТО И РУЧНОГО МЕТОДОВ
+    # 🔥 ОБРАБОТКА КОДА ДЛЯ АВТО И РУЧНОГО МЕТОДОВ (ИСПРАВЛЕННАЯ)
     async def verify_code(self, user_id: int, code: str):
         """Проверка кода для auto и manual методов"""
         if user_id not in self.active_sessions:
@@ -127,16 +131,12 @@ class SessionManager:
         data = self.active_sessions[user_id]
         
         try:
-            if data['method'] == 'auto':
-                # Для авто метода
-                await data['client'].sign_in(
-                    phone=data['phone'],
-                    code=code,
-                    phone_code_hash=data['phone_code_hash']
-                )
-            else:
-                # Для ручного метода
-                await data['client'].start(phone=data['phone'], code=code)
+            # Используем правильный метод sign_in для всех случаев
+            await data['client'].sign_in(
+                phone=data['phone'],
+                code=code,
+                phone_code_hash=data['phone_code_hash']
+            )
             
             session_string = data['client'].session.save()
             await data['client'].disconnect()
@@ -250,20 +250,8 @@ async def handle_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                        "⏳ Ожидаем ~2 минуты..."
             )
             
-            # Ждем авторизацию
-            await asyncio.sleep(10)  # Даем время на сканирование
-            
-            success, result = await manager.wait_qr_login(user_id)
-            
-            if success:
-                await query.message.reply_document(
-                    document=result.encode('utf-8'),
-                    filename='telegram_session.txt',
-                    caption="✅ **Сессия создана через QR-код!**"
-                )
-                await query.message.reply_text(f"`{result}`", parse_mode='Markdown')
-            else:
-                await query.message.reply_text(result)
+            # Ждем авторизацию в фоне
+            asyncio.create_task(process_qr_login(user_id, query.message))
             
             return ConversationHandler.END
         else:
@@ -279,6 +267,23 @@ async def handle_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             f"Формат: +79123456789"
         )
         return PHONE
+
+async def process_qr_login(user_id: int, message):
+    """Фоновая обработка QR-логина"""
+    try:
+        success, result = await manager.wait_qr_login(user_id)
+        
+        if success:
+            await message.reply_document(
+                document=result.encode('utf-8'),
+                filename='telegram_session.txt',
+                caption="✅ **Сессия создана через QR-код!**"
+            )
+            await message.reply_text(f"`{result}`", parse_mode='Markdown')
+        else:
+            await message.reply_text(result)
+    except Exception as e:
+        await message.reply_text(f"❌ Ошибка: {str(e)}")
 
 async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработка номера телефона"""
@@ -309,8 +314,8 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     code = update.message.text.replace(' ', '')
     user_id = update.effective_user.id
     
-    if not code.isdigit():
-        await update.message.reply_text("❌ Код должен содержать только цифры")
+    if not code.isdigit() or len(code) < 4:
+        await update.message.reply_text("❌ Код должен содержать 4-5 цифр")
         return CODE
     
     processing_msg = await update.message.reply_text("🔄 Проверяем код...")
