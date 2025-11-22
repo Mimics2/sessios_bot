@@ -62,7 +62,8 @@ class SessionManager:
                     del self.qr_sessions[user_id]
                 except:
                     pass
-            del self.session_timeouts[user_id]
+            if user_id in self.session_timeouts:
+                del self.session_timeouts[user_id]
             logger.info(f"🧹 Очищена устаревшая сессия для {user_id}")
     
     async def create_fresh_session(self, phone: str, user_id: int, method: str):
@@ -495,33 +496,35 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ Операция отменена")
     return ConversationHandler.END
 
-# Периодическая очистка старых сессий
-async def cleanup_task():
-    while True:
-        await asyncio.sleep(60)  # Каждую минуту
-        await manager.cleanup_old_sessions()
-
 def main():
+    # Создаем приложение
     application = Application.builder().token(BOT_TOKEN).build()
     
+    # Conversation handler с исправленными настройками
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
-            METHOD: [CallbackQueryHandler(handle_method)],
+            METHOD: [CallbackQueryHandler(handle_method, pattern='^(auto|manual|qr)$')],
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone)],
             CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_code)],
             PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_password)]
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler('cancel', cancel)],
+        per_message=False  # Явно указываем настройку
     )
     
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", lambda u, c: u.message.reply_text("Используйте /start")))
     
-    # Запускаем фоновую очистку
-    asyncio.create_task(cleanup_task())
+    # Запускаем периодическую очистку через JobQueue
+    async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
+        await manager.cleanup_old_sessions()
     
-    logger.info("🤖 Бот запущен с системой очистки устаревших сессий!")
+    # Добавляем job для очистки каждые 2 минуты
+    application.job_queue.run_repeating(cleanup_job, interval=120, first=10)
+    
+    logger.info("🤖 Бот запущен с исправленной системой очистки!")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
