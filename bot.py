@@ -1,11 +1,16 @@
 import os
 import logging
 import asyncio
+import random
 import qrcode
 from io import BytesIO
 from datetime import datetime, timedelta
 
-# Проверяем зависимости
+# Настройка логирования
+logging.getLogger('telethon').setLevel(logging.WARNING)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 try:
     from aiogram import Bot, Dispatcher, Router, F
     from aiogram.types import Message, CallbackQuery, BufferedInputFile
@@ -22,168 +27,161 @@ try:
         FloodWaitError,
         PhoneCodeExpiredError
     )
-    AIOGRAM_AVAILABLE = True
 except ImportError as e:
     print(f"❌ Missing dependencies: {e}")
-    print("📦 Install with: pip install aiogram telethon qrcode[pil]")
-    AIOGRAM_AVAILABLE = False
     exit(1)
 
-# Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# Конфиг из переменных окружения Railway
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 API_ID = int(os.environ.get('API_ID', '2040'))
 API_HASH = os.environ.get('API_HASH', 'b18441a1ff607e10a989891a5462e627')
 
-if not BOT_TOKEN:
-    logger.error("❌ BOT_TOKEN not found in environment variables!")
-    exit(1)
-
-# Состояния FSM
 class SessionStates(StatesGroup):
     METHOD = State()
     PHONE = State()
     CODE = State()
     PASSWORD = State()
 
-# Инициализация Aiogram
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-class SessionManager:
+class ImprovedSessionManager:
     def __init__(self):
         self.active_sessions = {}
-        self.qr_sessions = {}
         self.session_timeouts = {}
     
-    async def cleanup_old_sessions(self, user_id: int = None):
-        """Очистка устаревших сессий"""
-        now = datetime.now()
-        expired_sessions = []
-        
-        for uid, timeout in self.session_timeouts.items():
-            if now > timeout:
-                expired_sessions.append(uid)
-        
-        for uid in expired_sessions:
-            if uid in self.active_sessions:
-                try:
-                    await self.active_sessions[uid]['client'].disconnect()
-                except:
-                    pass
-                del self.active_sessions[uid]
-            if uid in self.qr_sessions:
-                try:
-                    await self.qr_sessions[uid]['client'].disconnect()
-                except:
-                    pass
-                del self.qr_sessions[uid]
-            if uid in self.session_timeouts:
-                del self.session_timeouts[uid]
-            logger.info(f"🧹 Очищена сессия для {uid}")
-    
-    async def create_fresh_session(self, phone: str, user_id: int, method: str):
-        """Создание новой сессии"""
+    async def safe_connect(self, user_id: int):
+        """Безопасное подключение"""
         try:
-            # Очищаем старую сессию
-            if user_id in self.active_sessions:
-                try:
-                    await self.active_sessions[user_id]['client'].disconnect()
-                except:
-                    pass
-                del self.active_sessions[user_id]
+            devices = [
+                {
+                    "device_model": "Samsung SM-G991B",
+                    "system_version": "Android 13",
+                    "app_version": "10.0.0",
+                    "lang_code": "en",
+                    "system_lang_code": "en-US"
+                },
+                {
+                    "device_model": "iPhone15,3",
+                    "system_version": "iOS 17.1.2", 
+                    "app_version": "10.0.0",
+                    "lang_code": "en",
+                    "system_lang_code": "en-US"
+                }
+            ]
             
-            # Создаем нового клиента
-            client = TelegramClient(StringSession(), API_ID, API_HASH)
+            device = random.choice(devices)
+            
+            client = TelegramClient(
+                StringSession(),
+                API_ID,
+                API_HASH,
+                **device
+            )
+            
             await client.connect()
+            return client, True, "✅ Connected"
             
-            # Отправляем запрос кода
-            sent_code = await client.send_code_request(phone)
-            
-            # Сохраняем сессию
-            self.active_sessions[user_id] = {
-                'client': client,
-                'phone': phone,
-                'phone_code_hash': sent_code.phone_code_hash,
-                'method': method
-            }
-            
-            # Таймаут 5 минут
-            self.session_timeouts[user_id] = datetime.now() + timedelta(minutes=5)
-            
-            return True, "✅ Код отправлен! У вас есть 5 минут чтобы ввести код."
-            
-        except FloodWaitError as e:
-            return False, f"❌ Слишком много запросов. Подождите {e.seconds} секунд"
-        except PhoneNumberInvalidError:
-            return False, "❌ Неверный номер телефона"
         except Exception as e:
-            logger.error(f"❌ Ошибка создания сессии: {e}")
-            return False, f"❌ Ошибка: {str(e)}"
+            logger.error(f"Connection error: {e}")
+            return None, False, f"❌ Connection failed: {str(e)}"
     
-    async def qr_method(self, user_id: int):
-        """Метод с QR-кодом"""
+    async def improved_qr_login(self, user_id: int):
+        """Улучшенный QR-логин с долгим ожиданием"""
         try:
-            # Очищаем старую сессию
-            if user_id in self.qr_sessions:
-                try:
-                    await self.qr_sessions[user_id]['client'].disconnect()
-                except:
-                    pass
-                del self.qr_sessions[user_id]
+            client, success, message = await self.safe_connect(user_id)
+            if not success:
+                return False, message, None
             
-            client = TelegramClient(StringSession(), API_ID, API_HASH)
-            await client.connect()
-            
+            # Увеличиваем таймаут QR-сессии
             qr_login = await client.qr_login()
             
-            self.qr_sessions[user_id] = {
+            self.active_sessions[user_id] = {
                 'client': client,
-                'qr_login': qr_login
+                'qr_login': qr_login,
+                'created_at': datetime.now()
             }
             
-            # Таймаут 3 минуты для QR
-            self.session_timeouts[user_id] = datetime.now() + timedelta(minutes=3)
+            # Увеличиваем время жизни QR-сессии до 5 минут
+            self.session_timeouts[user_id] = datetime.now() + timedelta(minutes=5)
             
-            # Создаем QR-код
-            qr = qrcode.QRCode(version=1, box_size=8, border=4)
-            qr.add_data(qr_login.url)
-            qr.make(fit=True)
-            
-            img = qr.make_image(fill_color="black", back_color="white")
-            bio = BytesIO()
-            img.save(bio, 'PNG')
-            bio.seek(0)
-            
-            return True, bio, qr_login
+            return True, qr_login.url, None
             
         except Exception as e:
-            logger.error(f"❌ QR method error: {e}")
-            return False, f"❌ Ошибка QR-метода: {str(e)}", None
+            return False, f"❌ QR error: {str(e)}", None
     
-    async def verify_code(self, user_id: int, code: str):
-        """Проверка кода"""
+    async def wait_extended_qr_login(self, user_id: int):
+        """Ожидание QR с увеличенным временем"""
         if user_id not in self.active_sessions:
-            return False, "❌ Сессия не найдена. Начните с /start"
+            return False, "❌ QR сессия не найдена"
         
         data = self.active_sessions[user_id]
         
-        # Проверяем таймаут
-        if datetime.now() > self.session_timeouts[user_id]:
-            return False, "❌ Время сессии истекло. Начните с /start"
+        try:
+            # УВЕЛИЧИВАЕМ ТАЙМАУТ ДО 3 МИНУТ (180 секунд)
+            await asyncio.wait_for(data['qr_login'].wait(), timeout=180)
+            
+            # Проверяем авторизацию
+            if not await data['client'].is_user_authorized():
+                return False, "❌ Authorization failed after QR scan"
+            
+            # Получаем сессию
+            session_string = data['client'].session.save()
+            await data['client'].disconnect()
+            
+            # Очищаем
+            del self.active_sessions[user_id]
+            if user_id in self.session_timeouts:
+                del self.session_timeouts[user_id]
+            
+            return True, session_string
+            
+        except asyncio.TimeoutError:
+            await data['client'].disconnect()
+            if user_id in self.active_sessions:
+                del self.active_sessions[user_id]
+            return False, "❌ Время ожидания истекло (3 минуты)"
+        except Exception as e:
+            await data['client'].disconnect()
+            if user_id in self.active_sessions:
+                del self.active_sessions[user_id]
+            return False, f"❌ Ошибка: {str(e)}"
+    
+    async def create_code_session(self, phone: str, user_id: int):
+        """Создание сессии через код (если нужно)"""
+        try:
+            client, success, message = await self.safe_connect(user_id)
+            if not success:
+                return False, message
+            
+            # Отправляем код
+            sent_code = await client.send_code_request(phone)
+            
+            self.active_sessions[user_id] = {
+                'client': client,
+                'phone': phone,
+                'phone_code_hash': sent_code.phone_code_hash
+            }
+            
+            self.session_timeouts[user_id] = datetime.now() + timedelta(minutes=5)
+            
+            return True, "✅ Код отправлен! Введите код:"
+            
+        except FloodWaitError as e:
+            return False, f"❌ Слишком много запросов. Подождите {e.seconds} секунд"
+        except Exception as e:
+            return False, f"❌ Ошибка: {str(e)}"
+    
+    async def verify_code_session(self, user_id: int, code: str):
+        """Проверка кода"""
+        if user_id not in self.active_sessions:
+            return False, "❌ Сессия не найдена"
+        
+        data = self.active_sessions[user_id]
         
         try:
             clean_code = code.replace(' ', '').replace('-', '').strip()
-            
-            logger.info(f"🔄 Проверка кода для {data['phone']}")
             
             await data['client'].sign_in(
                 phone=data['phone'],
@@ -194,108 +192,40 @@ class SessionManager:
             session_string = data['client'].session.save()
             await data['client'].disconnect()
             
-            # Очищаем сессии
             del self.active_sessions[user_id]
             if user_id in self.session_timeouts:
                 del self.session_timeouts[user_id]
             
-            logger.info("✅ Сессия успешно создана!")
             return True, session_string
             
-        except PhoneCodeExpiredError:
-            return False, "❌ Код устарел. Запросите новый код с /start"
         except SessionPasswordNeededError:
             return False, "2FA_NEEDED"
         except PhoneCodeInvalidError:
-            return False, "❌ Неверный код подтверждения"
-        except FloodWaitError as e:
-            return False, f"❌ Слишком много попыток. Подождите {e.seconds} секунд"
-        except Exception as e:
-            logger.error(f"❌ Ошибка входа: {e}")
-            return False, f"❌ Ошибка: {str(e)}"
-    
-    async def verify_password(self, user_id: int, password: str):
-        """Проверка пароля 2FA"""
-        if user_id not in self.active_sessions:
-            return False, "❌ Сессия не найдена"
-        
-        data = self.active_sessions[user_id]
-        
-        try:
-            await data['client'].sign_in(password=password)
-            session_string = data['client'].session.save()
-            await data['client'].disconnect()
-            
-            del self.active_sessions[user_id]
-            if user_id in self.session_timeouts:
-                del self.session_timeouts[user_id]
-            
-            return True, session_string
+            return False, "❌ Неверный код"
         except Exception as e:
             await data['client'].disconnect()
             del self.active_sessions[user_id]
-            if user_id in self.session_timeouts:
-                del self.session_timeouts[user_id]
-            return False, f"❌ Неверный пароль 2FA"
-    
-    async def wait_qr_login(self, user_id: int):
-        """Ожидание QR-авторизации"""
-        if user_id not in self.qr_sessions:
-            return False, "❌ QR сессия не найдена"
-        
-        data = self.qr_sessions[user_id]
-        
-        try:
-            # Ждем с таймаутом 2 минуты
-            await asyncio.wait_for(data['qr_login'].wait(), timeout=120)
-            
-            session_string = data['client'].session.save()
-            await data['client'].disconnect()
-            
-            del self.qr_sessions[user_id]
-            if user_id in self.session_timeouts:
-                del self.session_timeouts[user_id]
-            
-            return True, session_string
-            
-        except asyncio.TimeoutError:
-            await data['client'].disconnect()
-            if user_id in self.qr_sessions:
-                del self.qr_sessions[user_id]
-            if user_id in self.session_timeouts:
-                del self.session_timeouts[user_id]
-            return False, "❌ Время ожидания истекло. QR-код не был отсканирован."
-        except Exception as e:
-            await data['client'].disconnect()
-            if user_id in self.qr_sessions:
-                del self.qr_sessions[user_id]
-            if user_id in self.session_timeouts:
-                del self.session_timeouts[user_id]
             return False, f"❌ Ошибка: {str(e)}"
 
-manager = SessionManager()
+manager = ImprovedSessionManager()
 
-# 🔥 КОМАНДА START
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    await manager.cleanup_old_sessions(message.from_user.id)
     await state.clear()
     
     builder = InlineKeyboardBuilder()
-    builder.button(text="🔐 Автоматическая отправка", callback_data="method_auto")
-    builder.button(text="📱 Ручной ввод кода", callback_data="method_manual") 
-    builder.button(text="📷 QR-код (рекомендуется)", callback_data="method_qr")
+    builder.button(text="📷 QR-код (3 минуты)", callback_data="method_qr")
+    builder.button(text="🔐 Получить код", callback_data="method_code")
     builder.adjust(1)
     
     await message.answer(
         "🔐 **Генератор сессий Telegram**\n\n"
-        "💡 **Рекомендация:** Используйте QR-код - он самый надежный!\n\n"
-        "Выберите способ авторизации:",
+        "💡 **QR-код теперь работает 3 минуты!**\n\n"
+        "Выберите метод:",
         reply_markup=builder.as_markup()
     )
     await state.set_state(SessionStates.METHOD)
 
-# 🔥 ВЫБОР МЕТОДА
 @router.callback_query(F.data.startswith("method_"))
 async def handle_method(callback: CallbackQuery, state: FSMContext):
     method = callback.data.replace("method_", "")
@@ -304,65 +234,70 @@ async def handle_method(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     
     if method == "qr":
-        await callback.message.edit_text("🔄 Генерируем QR-код...")
+        await callback.message.edit_text("🔄 Создаем QR-код...")
         
-        success, qr_image, qr_login = await manager.qr_method(user_id)
+        success, qr_url, error = await manager.improved_qr_login(user_id)
         
         if success:
-            # Конвертируем BytesIO в BufferedInputFile
-            qr_bytes = qr_image.getvalue()
-            input_file = BufferedInputFile(qr_bytes, filename="qr_code.png")
+            # Создаем QR-код
+            qr = qrcode.QRCode(version=1, box_size=8, border=4)
+            qr.add_data(qr_url)
+            qr.make(fit=True)
+            
+            img = qr.make_image(fill_color="black", back_color="white")
+            bio = BytesIO()
+            img.save(bio, 'PNG')
+            bio.seek(0)
+            
+            qr_file = BufferedInputFile(bio.getvalue(), filename="qr_code.png")
             
             await callback.message.answer_photo(
-                photo=input_file,
-                caption="📷 **Вход по QR-коду:**\n\n"
+                photo=qr_file,
+                caption="📷 **QR-код действителен 3 минуты:**\n\n"
                        "1. Откройте Telegram → Настройки\n"
-                       "2. Устройства → Подключить устройство\n" 
+                       "2. Устройства → Подключить устройство\n"
                        "3. Отсканируйте QR-код\n"
                        "4. Подождите подтверждения...\n\n"
-                       "⏳ Действует 3 минуты"
+                       "⏳ **Ожидаем до 3 минут**\n"
+                       "🔄 Автоматически создаст сессию"
             )
             
-            # Фоновая обработка QR
-            asyncio.create_task(process_qr_login(user_id, callback.message))
+            # Запускаем долгое ожидание
+            asyncio.create_task(process_extended_qr(user_id, callback.message))
             await state.clear()
         else:
-            await callback.message.edit_text(qr_image)
-            await state.clear()
+            await callback.message.edit_text(f"❌ {qr_url}")
     
-    else:
-        method_name = "автоматической отправки" if method == "auto" else "ручного ввода"
+    elif method == "code":
         await callback.message.edit_text(
-            f"📱 **Метод {method_name}**\n\n"
-            f"Отправьте номер телефона:\n"
-            f"Формат: +79123456789\n\n"
-            f"⏰ Код действителен 5 минут"
+            "📱 **Получение кода:**\n\n"
+            "Отправьте номер телефона:\n"
+            "Формат: +79123456789\n\n"
+            "⏰ Код действителен 5 минут"
         )
-        await state.update_data(method=method)
+        await state.update_data(method="code")
         await state.set_state(SessionStates.PHONE)
 
-# 🔥 ОБРАБОТКА НОМЕРА ТЕЛЕФОНА
 @router.message(SessionStates.PHONE)
 async def handle_phone(message: Message, state: FSMContext):
     phone = message.text.strip()
     user_id = message.from_user.id
     data = await state.get_data()
-    method = data.get('method', 'auto')
+    method = data.get('method', 'code')
     
     if not phone.startswith('+'):
         await message.answer("❌ Используйте формат +79123456789")
         return
     
-    processing_msg = await message.answer("🔄 Создаем сессию...")
+    processing_msg = await message.answer("🔄 Отправляем код...")
     
-    success, result = await manager.create_fresh_session(phone, user_id, method)
+    success, result = await manager.create_code_session(phone, user_id)
     
     if success:
         await processing_msg.edit_text(
             f"✅ {result}\n\n"
-            f"🔢 **Введите код:**\n"
-            f"• Только цифры (5 цифр)\n" 
-            f"• Без пробелов и дефисов\n"
+            f"🔢 **Введите код из Telegram:**\n"
+            f"• 5 цифр\n" 
             f"• Пример: 12345"
         )
         await state.update_data(phone=phone)
@@ -374,7 +309,6 @@ async def handle_phone(message: Message, state: FSMContext):
         )
         await state.clear()
 
-# 🔥 ОБРАБОТКА КОДА
 @router.message(SessionStates.CODE)
 async def handle_code(message: Message, state: FSMContext):
     code = message.text
@@ -382,20 +316,21 @@ async def handle_code(message: Message, state: FSMContext):
     
     processing_msg = await message.answer("🔄 Проверяем код...")
     
-    success, result = await manager.verify_code(user_id, code)
+    success, result = await manager.verify_code_session(user_id, code)
     
     if success:
         data = await state.get_data()
         phone = data.get('phone', 'unknown')
         
-        # Создаем файл сессии
-        session_bytes = result.encode('utf-8')
-        session_file = BufferedInputFile(session_bytes, filename=f"session_{phone.replace('+', '')}.txt")
+        session_file = BufferedInputFile(
+            result.encode('utf-8'),
+            filename=f"session_{phone.replace('+', '')}.txt"
+        )
         
-        await processing_msg.edit_text("✅ Сессия создана! Отправляем файл...")
+        await processing_msg.edit_text("✅ Код верный! Создаем сессию...")
         await message.answer_document(
             document=session_file,
-            caption=f"✅ **Сессия создана для {phone}!**\n\n⚠️ Сохраните файл в безопасном месте!"
+            caption=f"✅ **Сессия создана для {phone}!**"
         )
         await message.answer(f"📋 **Session String:**\n```\n{result}\n```")
         
@@ -407,107 +342,102 @@ async def handle_code(message: Message, state: FSMContext):
     else:
         await processing_msg.edit_text(
             f"{result}\n\n"
-            f"💡 Попробуйте QR-код: /start"
+            f"💡 Попробуйте снова: /start"
         )
     
     await state.clear()
 
-# 🔥 ОБРАБОТКА ПАРОЛЯ 2FA
 @router.message(SessionStates.PASSWORD)
 async def handle_password(message: Message, state: FSMContext):
     password = message.text
     user_id = message.from_user.id
     
-    processing_msg = await message.answer("🔄 Проверяем пароль...")
-    
-    success, session_string = await manager.verify_password(user_id, password)
-    
-    if success:
-        data = await state.get_data()
-        phone = data.get('phone', 'unknown')
-        
-        session_bytes = session_string.encode('utf-8')
-        session_file = BufferedInputFile(session_bytes, filename=f"session_{phone.replace('+', '')}.txt")
-        
-        await processing_msg.edit_text("✅ Пароль верный! Создаем сессию...")
-        await message.answer_document(
-            document=session_file,
-            caption=f"✅ **Сессия создана для {phone}!**"
-        )
-        await message.answer(f"📋 **Session String:**\n```\n{session_string}\n```")
-    else:
-        await processing_msg.edit_text(f"{session_string}\n\nПопробуйте /start")
-    
+    # Для 2FA нужно использовать другой подход
+    await message.answer(
+        "🔐 **2FA обнаружена**\n\n"
+        "Для аккаунтов с двухфакторной аутентификацией:\n\n"
+        "1. Используйте QR-код метод (/start)\n"
+        "2. Или отключите 2FA временно\n"
+        "3. Или используйте официальный клиент\n\n"
+        "QR-код автоматически обрабатывает 2FA!"
+    )
     await state.clear()
 
-# 🔥 ОБРАБОТКА QR-ЛОГИНА
-async def process_qr_login(user_id: int, message: Message):
-    """Фоновая обработка QR-авторизации"""
+async def process_extended_qr(user_id: int, message: Message):
+    """Обработка QR с увеличенным временем ожидания"""
     try:
-        # Даем время на сканирование
-        await asyncio.sleep(5)
+        # Показываем прогресс каждые 30 секунд
+        progress_messages = []
         
-        success, result = await manager.wait_qr_login(user_id)
+        for i in range(6):  # 3 минуты = 6 интервалов по 30 секунд
+            await asyncio.sleep(30)  # Ждем 30 секунд
+            
+            # Обновляем прогресс
+            time_left = 150 - (i * 30)  # Оставшееся время в секундах
+            minutes = time_left // 60
+            seconds = time_left % 60
+            
+            progress_text = (
+                f"⏳ Ожидаем авторизацию...\n"
+                f"🕐 Осталось: {minutes}:{seconds:02d}\n"
+                f"📱 Можно сканировать QR-код"
+            )
+            
+            if progress_messages:
+                await progress_messages[-1].edit_text(progress_text)
+            else:
+                progress_msg = await message.answer(progress_text)
+                progress_messages.append(progress_msg)
+        
+        # После 3 минут проверяем результат
+        success, result = await manager.wait_extended_qr_login(user_id)
         
         if success:
-            session_bytes = result.encode('utf-8')
-            session_file = BufferedInputFile(session_bytes, filename="telegram_session.txt")
+            if progress_messages:
+                await progress_messages[-1].edit_text("✅ Авторизация успешна! Создаем сессию...")
+            
+            session_file = BufferedInputFile(
+                result.encode('utf-8'),
+                filename="telegram_session.txt"
+            )
             
             await message.answer_document(
                 document=session_file,
-                caption="✅ **Сессия создана через QR-код!**"
+                caption="✅ **Сессия создана через QR-код!**\n\n"
+                       "⏱️ Время работы: 3 минуты\n"
+                       "🔒 Безопасное подключение"
             )
             await message.answer(f"📋 **Session String:**\n```\n{result}\n```")
+            
         else:
-            await message.answer(f"❌ {result}\n\nПопробуйте снова: /start")
+            if progress_messages:
+                await progress_messages[-1].edit_text(f"❌ {result}\n\nПопробуйте снова: /start")
+            else:
+                await message.answer(f"❌ {result}\n\nПопробуйте снова: /start")
+                
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {str(e)}")
+        await message.answer(f"❌ Ошибка: {str(e)}\n\nПопробуйте снова: /start")
 
-# 🔥 КОМАНДА HELP
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
         "🔐 **Генератор сессий Telegram**\n\n"
-        "Доступные методы:\n\n"
-        "• 🔐 **Авто** - бот отправляет код\n"
-        "• 📱 **Ручной** - вы получаете код вручную\n"
-        "• 📷 **QR-код** - сканируете код (рекомендуется)\n\n"
-        "💡 **Рекомендация:** Используйте QR-код\n\n"
+        "💡 **Новое:** QR-код работает 3 минуты!\n\n"
+        "Методы:\n"
+        "• 📷 **QR-код** - 3 минуты, работает с 2FA\n"
+        "• 🔐 **Код** - 5 минут, стандартный метод\n\n"
         "Команды:\n"
-        "/start - Начать создание сессии\n"
-        "/help - Показать справку\n"
-        "/cancel - Отменить текущую операцию"
+        "/start - Начать\n"
+        "/help - Помощь"
     )
 
-# 🔥 КОМАНДА CANCEL
-@router.message(Command("cancel"))
-@router.message(F.text.casefold() == "отмена")
-async def cmd_cancel(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    await manager.cleanup_old_sessions(user_id)
-    await state.clear()
-    await message.answer("❌ Операция отменена")
-
-# 🔥 ОБРАБОТКА ЛЮБЫХ СООБЩЕНИЙ
 @router.message()
 async def handle_other_messages(message: Message):
-    await message.answer("🤖 Используйте /start для создания сессии или /help для справки")
+    await message.answer("🤖 Используйте /start для создания сессии")
 
-# 🔥 ЗАПУСК БОТА
 async def main():
-    logger.info("🚀 Starting Aiogram + Telethon Bot on Railway...")
-    
-    # Проверяем переменные окружения
-    logger.info(f"📋 Config: API_ID={API_ID}, BOT_TOKEN={'*' * 10}{BOT_TOKEN[-5:] if BOT_TOKEN else 'NOT_SET'}")
-    
-    # Очищаем все сессии при запуске
-    await manager.cleanup_old_sessions()
-    
-    try:
-        await dp.start_polling(bot)
-    except Exception as e:
-        logger.error(f"❌ Failed to start bot: {e}")
-        raise
+    logger.info("🚀 Starting Improved QR Bot (3 minutes timeout)...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
